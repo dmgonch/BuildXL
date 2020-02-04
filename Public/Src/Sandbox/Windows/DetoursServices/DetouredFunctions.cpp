@@ -1819,6 +1819,7 @@ BOOL WINAPI Detoured_CreateProcessW(
     _Out_       LPPROCESS_INFORMATION lpProcessInformation)
 {
     bool injectedShim = false;
+    bool monitorChildProcesses = true;
     BOOL ret = MaybeInjectSubstituteProcessShim(
         lpApplicationName,
         lpCommandLine,
@@ -1830,14 +1831,15 @@ BOOL WINAPI Detoured_CreateProcessW(
         lpCurrentDirectory,
         lpStartupInfo,
         lpProcessInformation,
-        injectedShim);
+        injectedShim,
+        monitorChildProcesses);
     if (injectedShim)
     {
-        Dbg(L"Injected shim for lpCommandLine='%s', returning 0x%08X from CreateProcessW", lpCommandLine, ret);
+        Dbg(L"Detoured_CreateProcessW (PID=%d):Injected shim for lpCommandLine='%s', returning 0x%08X from CreateProcessW", g_currentProcessId, lpCommandLine, ret);
         return ret;
     }
 
-    if (!MonitorChildProcesses())
+    if (!monitorChildProcesses || !MonitorChildProcesses())
     {
         return Real_CreateProcessW(
             lpApplicationName,

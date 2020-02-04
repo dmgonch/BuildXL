@@ -51,7 +51,7 @@ static BOOL WINAPI InjectShim(
     wcscat_s(fullCommandLine, fullCmdLineSizeInChars, L"\" ");
     wcscat_s(fullCommandLine, fullCmdLineSizeInChars, argumentsWithoutCommand.c_str());
 
-    Dbg(L"Injecting substitute shim '%s' for process command line '%s'", g_substituteProcessExecutionShimPath, fullCommandLine);
+    Dbg(L"Shim (PID=%d): Injecting substitute shim '%s' for process command line '%s'", g_currentProcessId, g_substituteProcessExecutionShimPath, fullCommandLine);
     BOOL rv = Real_CreateProcessW(
         /*lpApplicationName:*/ g_substituteProcessExecutionShimPath,
         /*lpCommandLine:*/ fullCommandLine,
@@ -256,6 +256,39 @@ static bool ReadRawResponseFile(const wchar_t* responseFilePath, char*& pText, D
     return success;
 }
 
+// CODESYNC: Keep the even name in sync with the C# side
+LPCWSTR g_disableProcessSubstitutionEventName = L"Local\\AnyBuild-DisableProcessSubstitution";
+volatile HANDLE g_disableProcessSubstitutionEvent = nullptr;
+
+static bool IsSubstitutionGloballyEnabled(const wstring &command, wstring &commandArgs)
+{
+    if (g_disableProcessSubstitutionEvent == nullptr)
+    {
+        // Racing b/w threads is OK here as long as the last writer could successfully get the handle.
+        // And if it couldn't then at worst the shim process will be launched.
+        g_disableProcessSubstitutionEvent = OpenEventW(SYNCHRONIZE, FALSE, g_disableProcessSubstitutionEventName);
+    }
+
+    if (g_disableProcessSubstitutionEvent == nullptr)
+    {
+        DWORD err = GetLastError();
+        Dbg(L"ShouldSubstituteShim (PID=%d): Failed to open event %s: 0x%08x (command='%s', args='%s)",
+            g_currentProcessId, g_disableProcessSubstitutionEventName, (int)err, command.c_str(), commandArgs.c_str());
+        return false;
+    }
+
+    DWORD waitResult = WaitForSingleObject(g_disableProcessSubstitutionEvent, 0);
+    if (waitResult == WAIT_OBJECT_0)
+    {
+        Dbg(L"ShouldSubstituteShim (PID=%d): Skip process substitution because it is globally disabled (command='%s', args='%s)",
+            g_currentProcessId, command.c_str(), commandArgs.c_str());
+        return false;
+    }
+
+    Dbg(L"ShouldSubstituteShim (PID=%d): Proceed with process substitution (command='%s', args='%s)", g_currentProcessId, command.c_str(), commandArgs.c_str());
+    return true;
+}
+
 static bool ShouldSubstituteShim(const wstring &command, wstring &commandArgs)
 {
     assert(g_substituteProcessExecutionShimPath != nullptr);
@@ -421,12 +454,12 @@ static bool ShouldSubstituteShim(const wstring &command, wstring &commandArgs)
                 delete[] pText;
             }
 
-            Dbg(L"Shim: Found %d inputs, injecting shim since matches min %d, from args='%s'", numInputs, minParallelism, commandArgs.c_str());
+            Dbg(L"Shim (PID=%d): Found %d inputs, injecting shim since matches min %d, from args='%s'", g_currentProcessId, numInputs, minParallelism, commandArgs.c_str());
             return true; 
         }
         else
         {
-            Dbg(L"Shim: Found %d inputs, running locally since min is %d, from args='%s'", numInputs, minParallelism, commandArgs.c_str());
+            Dbg(L"Shim (PID=%d): Found %d inputs, running locally since min is %d, from args='%s'", g_currentProcessId, numInputs, minParallelism, commandArgs.c_str());
         }
 
         delete[] pText;
@@ -436,6 +469,9 @@ static bool ShouldSubstituteShim(const wstring &command, wstring &commandArgs)
     // An opt-in list, shim if matching.
     return foundMatch;
 }
+
+const wchar_t BackSlashClExe[] = L"\\cl.exe";
+const size_t BackSlashClExeCharsCount = _countof(BackSlashClExe) - 1; // Number of chars in the string without the terminating null char
 
 BOOL WINAPI MaybeInjectSubstituteProcessShim(
     _In_opt_    LPCWSTR               lpApplicationName,
@@ -448,36 +484,47 @@ BOOL WINAPI MaybeInjectSubstituteProcessShim(
     _In_opt_    LPCWSTR               lpCurrentDirectory,
     _In_        LPSTARTUPINFOW        lpStartupInfo,
     _Out_       LPPROCESS_INFORMATION lpProcessInformation,
-    _Out_       bool&                 injectedShim)
+    _Out_       bool&                 injectedShim,
+    _Out_       bool&                 monitorChildProcesses)
 {
     if (g_substituteProcessExecutionShimPath != nullptr && (lpCommandLine != nullptr || lpApplicationName != nullptr))
     {
         // When lpCommandLine is null we just use lpApplicationName as the command line to parse.
         // When lpCommandLine is not null, it contains the command, possibly with quotes containing spaces,
         // as the first whitespace-delimited token; we can ignore lpApplicationName in this case.
-        Dbg(L"Shim: Finding command and args from lpApplicationName='%s', lpCommandLine='%s'", lpApplicationName, lpCommandLine);
+        Dbg(L"Shim (PID=%d): Finding command and args from command='%s', args='%s'", g_currentProcessId, lpApplicationName, lpCommandLine);
         LPCWSTR cmdLine = lpCommandLine == nullptr ? lpApplicationName : lpCommandLine;
         wstring command;
         wstring commandArgs;
         FindApplicationNameFromCommandLine(cmdLine, command, commandArgs);
-        Dbg(L"Shim: Found command='%s', args='%s' from lpApplicationName='%s', lpCommandLine='%s'", command.c_str(), commandArgs.c_str(), lpApplicationName, lpCommandLine);
+        Dbg(L"Shim (PID=%d): Found command='%s', args='%s' from lpApplicationName='%s', lpCommandLine='%s'", g_currentProcessId, command.c_str(), commandArgs.c_str(), lpApplicationName, lpCommandLine);
 
+        monitorChildProcesses = true;
         if (ShouldSubstituteShim(command, commandArgs))
         {
-            // Instead of Detouring the child, run the requested shim
-            // passing the original command line, but only for appropriate commands.
-            injectedShim = true;
-            return InjectShim(
-                command,
-                commandArgs,
-                lpProcessAttributes,
-                lpThreadAttributes,
-                bInheritHandles,
-                dwCreationFlags,
-                lpEnvironment,
-                lpCurrentDirectory,
-                lpStartupInfo,
-                lpProcessInformation);
+            // Do not monitor cl.exe children because replacing them with a shim could lead to 'D8040: error creating or communicating with child process' compiler error.
+            size_t commandLen = command.length();
+            monitorChildProcesses = commandLen < BackSlashClExeCharsCount || _wcsicmp(command.c_str() + commandLen - BackSlashClExeCharsCount, BackSlashClExe) != 0;
+            Dbg(L"Shim (PID=%d): Children monitoring is %s for command='%s' with args='%s'", g_currentProcessId, monitorChildProcesses ? L"enabled" : L"disabled", command.c_str(), commandArgs.c_str());
+
+            if (IsSubstitutionGloballyEnabled(command, commandArgs))
+            {
+                // Instead of Detouring the child, run the requested shim
+                // passing the original command line, but only for appropriate commands.
+                injectedShim = true;
+                monitorChildProcesses = false;
+                return InjectShim(
+                    command,
+                    commandArgs,
+                    lpProcessAttributes,
+                    lpThreadAttributes,
+                    bInheritHandles,
+                    dwCreationFlags,
+                    lpEnvironment,
+                    lpCurrentDirectory,
+                    lpStartupInfo,
+                    lpProcessInformation);
+            }
         }
     }
 

@@ -17,4 +17,5 @@ BOOL WINAPI MaybeInjectSubstituteProcessShim(
     _In_opt_    LPCWSTR               lpCurrentDirectory,
     _In_        LPSTARTUPINFOW        lpStartupInfo,
     _Out_       LPPROCESS_INFORMATION lpProcessInformation,
-    _Out_       bool&                 injectedShim);
+    _Out_       bool&                 injectedShim,
+    _Out_       bool&                 monitorChildProcesses);

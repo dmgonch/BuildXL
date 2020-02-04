@@ -567,6 +567,7 @@ InternalCreateDetouredProcess(
         }
     }
     else if (fProcCreated) {
+        Dbg(L"InternalCreateDetouredProcess (PID=%d): Created detoured process with PID=%d", g_currentProcessId, lpProcessInformation->dwProcessId);
         status = CreateDetouredProcessStatus::DetouringFailed;
     }
     else {
