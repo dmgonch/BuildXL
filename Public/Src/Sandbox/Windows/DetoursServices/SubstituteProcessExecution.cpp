@@ -256,28 +256,41 @@ static bool ReadRawResponseFile(const wchar_t* responseFilePath, char*& pText, D
     return success;
 }
 
-static bool ShouldSubstituteShim(const wstring &command, wstring &commandArgs)
-{
-    assert(g_substituteProcessExecutionShimPath != nullptr);
+// CODESYNC: Keep the even name in sync with the C# side
+LPCWSTR g_disableProcessSubstitutionEventName = L"Local\\AnyBuild-DisableProcessSubstitution";
+volatile HANDLE g_disableProcessSubstitutionEvent = nullptr;
 
-    // CODESYNC: Keep the even name in sync with the C# side
-    LPCWSTR disableProcessSubstitutionEventName = L"Local\\AnyBuild-DisableProcessSubstitution";
-    unique_handle<> disableProcessSubstitutionEvent(OpenEventW(SYNCHRONIZE, FALSE, disableProcessSubstitutionEventName));
-    if (!disableProcessSubstitutionEvent.isValid())
+static bool IsSubstitutionGloballyEnabled(const wstring &command, wstring &commandArgs)
+{
+    if (g_disableProcessSubstitutionEvent == nullptr)
+    {
+        // Racing b/w threads is OK here as long as the last writer could successfully get the handle.
+        // And if it couldn't then at worst the shim process will be launched.
+        g_disableProcessSubstitutionEvent = OpenEventW(SYNCHRONIZE, FALSE, g_disableProcessSubstitutionEventName);
+    }
+
+    if (g_disableProcessSubstitutionEvent == nullptr)
     {
         DWORD err = GetLastError();
-        Dbg(L"ShouldSubstituteShim: Failed to create event %s: 0x%08x (command='%s', args='%s)", disableProcessSubstitutionEventName, (int)err,
+        Dbg(L"ShouldSubstituteShim: Failed to open event %s: 0x%08x (command='%s', args='%s)", g_disableProcessSubstitutionEventName, (int)err,
             command.c_str(), commandArgs.c_str());
         return false;
     }
 
-    DWORD wfso = WaitForSingleObject(disableProcessSubstitutionEvent.get(), 0);
-    if (wfso == WAIT_OBJECT_0)
+    DWORD waitResult = WaitForSingleObject(g_disableProcessSubstitutionEvent, 0);
+    if (waitResult == WAIT_OBJECT_0)
     {
         Dbg(L"ShouldSubstituteShim: Skip process substitution because it is globally disabled (command='%s', args='%s)",
             command.c_str(), commandArgs.c_str());
         return false;
     }
+
+    return true;
+}
+
+static bool ShouldSubstituteShim(const wstring &command, wstring &commandArgs)
+{
+    assert(g_substituteProcessExecutionShimPath != nullptr);
 
     // Easy cases.
     if (g_pShimProcessMatches == nullptr || g_pShimProcessMatches->empty())
@@ -481,7 +494,7 @@ BOOL WINAPI MaybeInjectSubstituteProcessShim(
         FindApplicationNameFromCommandLine(cmdLine, command, commandArgs);
         Dbg(L"Shim: Found command='%s', args='%s' from lpApplicationName='%s', lpCommandLine='%s'", command.c_str(), commandArgs.c_str(), lpApplicationName, lpCommandLine);
 
-        if (ShouldSubstituteShim(command, commandArgs))
+        if (ShouldSubstituteShim(command, commandArgs) && IsSubstitutionGloballyEnabled(command, commandArgs))
         {
             // Instead of Detouring the child, run the requested shim
             // passing the original command line, but only for appropriate commands.
